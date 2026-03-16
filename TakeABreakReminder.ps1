@@ -1,9 +1,11 @@
 # ============================================================
-#  TakeABreakReminder.ps1  v4.0
-#  - No emojis, no internet needed, fully offline
+#  TakeABreakReminder.ps1  v6.0
+#  - Fully offline, no internet needed
 #  - Tracks ACTIVE screen time only
 #  - Timer resets when screen is locked
 #  - Auto-registers itself to run on every login (first run)
+#  - Writes logs to: C:\Logs\TakeABreakReminder\reminder.log
+#  - Uses system tray balloon notification (works on all Windows)
 # ============================================================
 
 # -----------------------------------------------
@@ -11,6 +13,8 @@
 # -----------------------------------------------
 $INTERVAL_MINS = 30
 $POLL_SECONDS  = 15
+$LOG_FILE      = "C:\Logs\TakeABreakReminder\reminder.log"
+$MAX_LOG_LINES = 500
 
 # -----------------------------------------------
 # ACTIVITY PROMPTS
@@ -29,17 +33,40 @@ $prompts = @(
 )
 
 # -----------------------------------------------
+# LOGGING
+# -----------------------------------------------
+function Write-Log($message) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line      = "[$timestamp] $message"
+
+    $dir = Split-Path $LOG_FILE
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    Add-Content -Path $LOG_FILE -Value $line
+    Write-Host "  $line"
+
+    if ((Get-Content $LOG_FILE | Measure-Object -Line).Lines -gt $MAX_LOG_LINES) {
+        $trimmed = Get-Content $LOG_FILE | Select-Object -Last $MAX_LOG_LINES
+        $trimmed | Set-Content $LOG_FILE
+    }
+}
+
+# -----------------------------------------------
 # AUTO-REGISTER WITH TASK SCHEDULER
-# Runs once — skips if task already exists
 # -----------------------------------------------
 function Register-StartupTask {
     $taskName = "TakeABreakReminder"
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existing) { return }
+    if ($existing) {
+        Write-Log "Task Scheduler entry already exists. Skipping registration."
+        return
+    }
 
     $scriptPath = $MyInvocation.ScriptName
     if (-not $scriptPath) {
-        Write-Host "  [Auto-start skipped: could not detect script path. Run from a saved .ps1 file.]"
+        Write-Log "Auto-start skipped: could not detect script path. Run from a saved .ps1 file."
         return
     }
 
@@ -50,16 +77,14 @@ function Register-StartupTask {
         $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 23)
         Register-ScheduledTask -TaskName $taskName -Action $action `
                                -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
-        Write-Host "  [Auto-start registered. Script will run on every login from now on.]"
+        Write-Log "Auto-start registered. Script will run on every login."
     } catch {
-        Write-Host "  [Auto-start failed. Run as Administrator to enable it.]"
+        Write-Log "Auto-start failed. Run as Administrator to enable it."
     }
 }
 
 # -----------------------------------------------
 # LOCK SCREEN DETECTION
-# Event ID 4800 = screen locked
-# Event ID 4801 = screen unlocked
 # -----------------------------------------------
 function Enable-LockAudit {
     try {
@@ -80,37 +105,24 @@ function Is-ScreenLocked {
 }
 
 # -----------------------------------------------
-# NOTIFICATIONS
+# NOTIFICATION — system tray balloon (works on all Windows)
 # -----------------------------------------------
-function Show-Toast($body) {
-    try {
-        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
-        $xml  = New-Object Windows.Data.Xml.Dom.XmlDocument
-        $xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>Take a Break</text><text>$body</text></binding></visual></toast>")
-        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("TakeABreakReminder").Show($toast)
-    } catch {
-        Add-Type -AssemblyName PresentationFramework
-        [System.Windows.MessageBox]::Show($body, "Take a Break") | Out-Null
-    }
-}
+Add-Type -AssemblyName System.Windows.Forms
 
-function Show-Terminal($body) {
-    $line = "-" * 60
-    Write-Host ""
-    Write-Host $line
-    Write-Host "  TAKE A BREAK"
-    Write-Host "  $body"
-    Write-Host "  Time: $(Get-Date -Format 'hh:mm tt')"
-    Write-Host $line
-    Write-Host ""
+$script:balloon = New-Object System.Windows.Forms.NotifyIcon
+$script:balloon.Icon    = [System.Drawing.SystemIcons]::Information
+$script:balloon.Visible = $true
+
+function Show-Notification($body) {
+    $script:balloon.BalloonTipTitle = "Take a Break"
+    $script:balloon.BalloonTipText  = $body
+    $script:balloon.ShowBalloonTip(10000)
 }
 
 function Fire-Reminder {
     $msg = $prompts | Get-Random
-    Show-Terminal $msg
-    Show-Toast $msg
+    Show-Notification $msg
+    Write-Log "REMINDER FIRED >> $msg"
 }
 
 # -----------------------------------------------
@@ -123,12 +135,7 @@ $intervalSeconds = $INTERVAL_MINS * 60
 $activeSeconds   = 0
 $wasLocked       = $false
 
-Write-Host ""
-Write-Host "  TakeABreakReminder is running."
-Write-Host "  Reminds after $INTERVAL_MINS minutes of active screen time."
-Write-Host "  Locking your screen resets the timer."
-Write-Host "  Press Ctrl+C to stop."
-Write-Host ""
+Write-Log "Script started. Interval: $INTERVAL_MINS minutes."
 
 while ($true) {
     Start-Sleep -Seconds $POLL_SECONDS
@@ -138,20 +145,20 @@ while ($true) {
     if ($locked) {
         if (-not $wasLocked) {
             $mins = [math]::Floor($activeSeconds / 60)
-            Write-Host "  Screen locked. Timer reset. (Was at $mins min active)"
+            Write-Log "Screen locked. Timer reset. (Was at $mins min active)"
             $activeSeconds = 0
         }
         $wasLocked = $true
     } else {
         if ($wasLocked) {
-            Write-Host "  Screen unlocked. Active timer started."
+            Write-Log "Screen unlocked. Active timer started."
         }
         $wasLocked      = $false
         $activeSeconds += $POLL_SECONDS
 
         if ($activeSeconds % 300 -eq 0) {
             $mins = [math]::Floor($activeSeconds / 60)
-            Write-Host "  Active for $mins min..."
+            Write-Log "Active for $mins min..."
         }
 
         if ($activeSeconds -ge $intervalSeconds) {
